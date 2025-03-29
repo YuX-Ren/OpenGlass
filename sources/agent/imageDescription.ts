@@ -18,7 +18,7 @@ export async function imageDescription(src: Uint8Array, model: KnownModel = 'moo
 }
 
 export async function llamaFind(question: string, images: string): Promise<string> {
-    return groqRequest(
+    return gptRequest(
              `
                 You are a smart AI that need to read through description of a images and answer user's questions.
 

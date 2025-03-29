@@ -1,5 +1,5 @@
 #define CAMERA_MODEL_XIAO_ESP32S3
-#include <I2S.h>
+#include <driver/i2s.h>  // Use ESP-IDF I2S driver
 #include <BLE2902.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -9,308 +9,179 @@
 #include "camera_pins.h"
 #include "mulaw.h"
 
-// Audio
-
-// Uncomment to switch the codec
-// Opus is still under development
-// Mulaw is used with the web app
-// PCM is used with the Friend app
-
-// To use with the web app, comment CODEC_PCM and
-// uncomment CODEC_MULAW
-
-// #define CODEC_OPUS
-// #define CODEC_MULAW
-#define CODEC_PCM
-
-#ifdef CODEC_OPUS
-
-#include <opus.h>
-
-#define OPUS_APPLICATION OPUS_APPLICATION_VOIP
-#define OPUS_BITRATE 16000
-
-OpusEncoder *opus_encoder = nullptr;
-
-#define CHANNELS 1
-#define MAX_PACKET_SIZE 1000
-
-#define SAMPLE_RATE 16000
-#define SAMPLE_BITS 16
-
-#else
-#ifdef CODEC_MULAW
-
-#define SAMPLE_RATE 8000
-#define SAMPLE_BITS 16
-
-#else
-
-#define FRAME_SIZE 160
-#define SAMPLE_RATE 16000
-#define SAMPLE_BITS 16
-
-#endif
-#endif
-
 //
 // BLE
 //
 
-// Device Information Service
-#define DEVICE_INFORMATION_SERVICE_UUID (uint16_t)0x180A
-#define MANUFACTURER_NAME_STRING_CHAR_UUID (uint16_t)0x2A29
-#define MODEL_NUMBER_STRING_CHAR_UUID (uint16_t)0x2A24
-#define FIRMWARE_REVISION_STRING_CHAR_UUID (uint16_t)0x2A26
-#define HARDWARE_REVISION_STRING_CHAR_UUID (uint16_t)0x2A27
-
-// Battery Level Service
-#define BATTERY_SERVICE_UUID (uint16_t)0x180F
-#define BATTERY_LEVEL_CHAR_UUID (uint16_t)0x2A19
-
-// Main Friend Service
 static BLEUUID serviceUUID("19B10000-E8F2-537E-4F6C-D104768A1214");
-static BLEUUID audioDataUUID("19B10001-E8F2-537E-4F6C-D104768A1214");
+static BLEUUID audioCharUUID("19B10001-E8F2-537E-4F6C-D104768A1214");
 static BLEUUID audioCodecUUID("19B10002-E8F2-537E-4F6C-D104768A1214");
-static BLEUUID photoDataUUID("19B10005-E8F2-537E-4F6C-D104768A1214");
-static BLEUUID photoControlUUID("19B10006-E8F2-537E-4F6C-D104768A1214");
+static BLEUUID photoCharUUID("19B10005-E8F2-537E-4F6C-D104768A1214");
 
-BLECharacteristic *audioDataCharacteristic;
-BLECharacteristic *photoDataCharacteristic;
-BLECharacteristic *photoControlCharacteristic;
-
-BLECharacteristic *batteryLevelCharacteristic;
-
-// State
-
+BLECharacteristic *audio;
+BLECharacteristic *photo;
 bool connected = false;
 
-uint16_t audio_frame_count = 0;
-
-bool isCapturingPhotos = false;
-int captureInterval = 0;
-unsigned long lastCaptureTime = 0;
-
-size_t sent_photo_bytes = 0;
-size_t sent_photo_frames = 0;
-bool photoDataUploading = false;
-
-uint8_t batteryLevel = 100;
-unsigned long lastBatteryUpdate = 0;
-
-void handlePhotoControl(int8_t controlValue);
-
-class ServerHandler : public BLEServerCallbacks
-{
-  void onConnect(BLEServer *server)
-  {
+class ServerHandler : public BLEServerCallbacks {
+  void onConnect(BLEServer *server) {
     connected = true;
+    Serial.println("Connected");
   }
 
-  void onDisconnect(BLEServer *server)
-  {
+  void onDisconnect(BLEServer *server) {
     connected = false;
+    Serial.println("Disconnected");
     BLEDevice::startAdvertising();
   }
 };
 
-class PhotoControlCallback : public BLECharacteristicCallbacks
-{
-  void onWrite(BLECharacteristic *characteristic)
-  {
-    if (characteristic->getLength() == 1)
-    {
-      handlePhotoControl(characteristic->getData()[0]);
-    }
+class MessageHandler : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic, esp_ble_gatts_cb_param_t *param) {
+    // Currently unused
+  }
+};
+
+volatile bool photo_ack_received = false;
+class PhotoCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic, esp_ble_gatts_cb_param_t *param) {
+    // Serial.println("ACK received from client");
+    // Set a global flag to proceed
+    photo_ack_received = true;
   }
 };
 
 void configure_ble() {
   BLEDevice::init("OpenGlass");
   BLEServer *server = BLEDevice::createServer();
-
-  // Main service
-
   BLEService *service = server->createService(serviceUUID);
 
-  // Audio characteristics
-  audioDataCharacteristic = service->createCharacteristic(
-    audioDataUUID,
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  // Audio service
+  audio = service->createCharacteristic(
+    audioCharUUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_INDICATE
   );
   BLE2902 *ccc = new BLE2902();
   ccc->setNotifications(true);
-  audioDataCharacteristic->addDescriptor(ccc);
+  audio->addDescriptor(ccc);
 
-  BLECharacteristic *audioCodecCharacteristic = service->createCharacteristic(
+  // Photo service
+  photo = service->createCharacteristic(
+    photoCharUUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  ccc = new BLE2902();
+  ccc->setNotifications(true);
+  photo->addDescriptor(ccc);
+  // set callback
+  photo->setCallbacks(new PhotoCallback());
+
+  // Codec service
+  BLECharacteristic *codec = service->createCharacteristic(
     audioCodecUUID,
-    BLECharacteristic::PROPERTY_READ);
-#ifdef CODEC_OPUS
-  uint8_t codecId = 20; // Opus 16khz
-#else
-#ifdef CODEC_MULAW
-  uint8_t codecId = 11; // MuLaw 8khz
-#else
-  uint8_t codecId = 1; // PCM 8khz
-#endif
-#endif
-  audioCodecCharacteristic->setValue(&codecId, 1);
+    BLECharacteristic::PROPERTY_READ
+  );
+  uint8_t codecId = 11; // MuLaw 8kHz
+  codec->setValue(&codecId, 1);
 
-  // Photo characteristics
-
-  photoDataCharacteristic = service->createCharacteristic(
-      photoDataUUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  ccc = new BLE2902();
-  ccc->setNotifications(true);
-  photoDataCharacteristic->addDescriptor(ccc);
-
-  BLECharacteristic *photoControlCharacteristic = service->createCharacteristic(
-      photoControlUUID,
-      BLECharacteristic::PROPERTY_WRITE);
-  photoControlCharacteristic->setCallbacks(new PhotoControlCallback());
-  uint8_t controlValue = 0;
-  photoControlCharacteristic->setValue(&controlValue, 1);
-
-  // Device Information Service
-
-  BLEService *deviceInfoService = server->createService(DEVICE_INFORMATION_SERVICE_UUID);
-  BLECharacteristic *manufacturerNameCharacteristic = deviceInfoService->createCharacteristic(
-      MANUFACTURER_NAME_STRING_CHAR_UUID,
-      BLECharacteristic::PROPERTY_READ);
-  BLECharacteristic *modelNumberCharacteristic = deviceInfoService->createCharacteristic(
-      MODEL_NUMBER_STRING_CHAR_UUID,
-      BLECharacteristic::PROPERTY_READ);
-  BLECharacteristic *firmwareRevisionCharacteristic = deviceInfoService->createCharacteristic(
-      FIRMWARE_REVISION_STRING_CHAR_UUID,
-      BLECharacteristic::PROPERTY_READ);
-  BLECharacteristic *hardwareRevisionCharacteristic = deviceInfoService->createCharacteristic(
-      HARDWARE_REVISION_STRING_CHAR_UUID,
-      BLECharacteristic::PROPERTY_READ);
-
-  manufacturerNameCharacteristic->setValue("Based Hardware");
-  modelNumberCharacteristic->setValue("OpenGlass");
-  firmwareRevisionCharacteristic->setValue("1.0.1");
-  hardwareRevisionCharacteristic->setValue("Seeed Xiao ESP32S3 Sense");
-
-  // Battery Service
-  BLEService *batteryService = server->createService(BATTERY_SERVICE_UUID);
-  batteryLevelCharacteristic = batteryService->createCharacteristic(
-      BATTERY_LEVEL_CHAR_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  ccc = new BLE2902();
-  ccc->setNotifications(true);
-  batteryLevelCharacteristic->addDescriptor(ccc);
-  batteryLevelCharacteristic->setValue(&batteryLevel, 1);
-
-  // Start the services
-  service->start();
-  deviceInfoService->start();
-  batteryService->start();
-
+  // Service
   server->setCallbacks(new ServerHandler());
+  service->start();
 
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
-  advertising->addServiceUUID(BATTERY_SERVICE_UUID);
-  advertising->addServiceUUID(DEVICE_INFORMATION_SERVICE_UUID);
   advertising->addServiceUUID(service->getUUID());
   advertising->setScanResponse(true);
-  advertising->setMinPreferred(0x06);
-  advertising->setMaxPreferred(0x12);
+  advertising->setMinPreferred(0x0);
+  advertising->setMinPreferred(0x1F);
   BLEDevice::startAdvertising();
 }
 
-camera_fb_t *fb;
+
+camera_fb_t *fb = NULL;
 
 bool take_photo() {
-  // Release buffer
-  if (fb) {
+  if (fb != NULL) {
+    Serial.println("Release FB");
     esp_camera_fb_return(fb);
+    fb = NULL;
   }
 
-  // Take a photo
+  Serial.println("Taking photo...");
   fb = esp_camera_fb_get();
+  Serial.println("Taking photo done...");
   if (!fb) {
     Serial.println("Failed to get camera frame buffer");
     return false;
   }
-
+  Serial.printf("fb pointer address: %p\n", fb);
+  Serial.printf("Photo taken, size: %d bytes\n", fb->len);
+  Serial.printf("fb read\n");
   return true;
-}
-
-void handlePhotoControl(int8_t controlValue)
-{
-  if (controlValue == -1)
-  {
-    // Take a single photo
-    isCapturingPhotos = true;
-    captureInterval = 0;
-  }
-  else if (controlValue == 0)
-  {
-    // Stop taking photos
-    isCapturingPhotos = false;
-    captureInterval = 0;
-  }
-  else if (controlValue >= 5 && controlValue <= 300)
-  {
-    // Start taking photos at specified interval
-    captureInterval = (controlValue / 5) * 5000; // Round to nearest 5 seconds and convert to milliseconds
-    isCapturingPhotos = true;
-    lastCaptureTime = millis() - captureInterval;
-  }
 }
 
 //
 // Microphone
 //
 
-#ifdef CODEC_OPUS
-
-static size_t recording_buffer_size = FRAME_SIZE * 2; // 16-bit samples
-static size_t compressed_buffer_size = MAX_PACKET_SIZE;
 #define VOLUME_GAIN 2
-
-#else
-#ifdef CODEC_MULAW
+#define SAMPLE_RATE 8000  // Fixed for MuLaw codec
+#define SAMPLE_BITS 16
 
 static size_t recording_buffer_size = 400;
 static size_t compressed_buffer_size = 400 + 3; /* header */
-#define VOLUME_GAIN 2
-
-#else
-
-static size_t recording_buffer_size = FRAME_SIZE * 2; // 16-bit samples
-static size_t compressed_buffer_size = recording_buffer_size + 3; /* header */
-#define VOLUME_GAIN 2
-
-#endif
-#endif
-
 static uint8_t *s_recording_buffer = nullptr;
 static uint8_t *s_compressed_frame = nullptr;
 static uint8_t *s_compressed_frame_2 = nullptr;
 
-void configure_microphone() {
+// void configure_microphone() {
+//   // Configure I2S for PDM microphone
+//   i2s_config_t i2s_config = {
+//     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),  // Master, receive, PDM mode
+//     .sample_rate = SAMPLE_RATE,  // 8kHz for MuLaw
+//     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+//     .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,  // Mono PDM
+//     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+//     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+//     .dma_buf_count = 8,
+//     .dma_buf_len = 64,
+//     .use_apll = false,
+//     .tx_desc_auto_clear = false,
+//     .fixed_mclk = 0
+//   };
 
-  // start I2S at 16 kHz with 16-bits per sample
-  I2S.setAllPins(-1, 42, 41, -1, -1);
-  if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, SAMPLE_BITS)) {
-    Serial.println("Failed to initialize I2S!");
-    while (1); // do nothing
-  }
+//   i2s_pin_config_t pin_config = {
+//     .bck_io_num = 42,    // BCLK
+//     .ws_io_num = 41,     // WS (Word Select)
+//     .data_out_num = I2S_PIN_NO_CHANGE,
+//     .data_in_num = I2S_PIN_NO_CHANGE
+//   };
 
-  // Allocate buffers
-  s_recording_buffer = (uint8_t *) ps_calloc(recording_buffer_size, sizeof(uint8_t));
-  s_compressed_frame = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
-  s_compressed_frame_2 = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
-}
+//   // Install and start I2S driver
+//   esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+//   if (err != ESP_OK) {
+//     Serial.printf("Failed to install I2S driver: %d\n", err);
+//     while (1);
+//   }
 
-size_t read_microphone() {
-  size_t bytes_recorded = 0;
-  esp_i2s::i2s_read(esp_i2s::I2S_NUM_0, s_recording_buffer, recording_buffer_size, &bytes_recorded, portMAX_DELAY);
-  return bytes_recorded;
-}
+//   err = i2s_set_pin(I2S_NUM_0, &pin_config);
+//   if (err != ESP_OK) {
+//     Serial.printf("Failed to set I2S pins: %d\n", err);
+//     while (1);
+//   }
+
+//   // Allocate buffers
+//   s_recording_buffer = (uint8_t *)ps_calloc(recording_buffer_size, sizeof(uint8_t));
+//   s_compressed_frame = (uint8_t *)ps_calloc(compressed_buffer_size, sizeof(uint8_t));
+//   s_compressed_frame_2 = (uint8_t *)ps_calloc(compressed_buffer_size, sizeof(uint8_t));
+// }
+
+// size_t read_microphone() {
+//   size_t bytes_recorded = 0;
+//   esp_err_t err = i2s_read(I2S_NUM_0, s_recording_buffer, recording_buffer_size, &bytes_recorded, portMAX_DELAY);
+//   if (err != ESP_OK) {
+//     Serial.printf("I2S read error: %d\n", err);
+//   }
+//   return bytes_recorded;
+// }
 
 //
 // Camera
@@ -341,140 +212,87 @@ void configure_camera() {
   config.pixel_format = PIXFORMAT_JPEG; // for streaming
   config.fb_count = 1;
 
-  // High quality (psram)
-  // config.jpeg_quality = 10;
-  // config.fb_count = 2;
-  // config.grab_mode = CAMERA_GRAB_LATEST;
-
-  // Low quality (and in local ram)
   config.jpeg_quality = 10;
   config.frame_size = FRAMESIZE_SVGA;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  // config.fb_location = CAMERA_FB_IN_DRAM;
+  s_compressed_frame_2 = (uint8_t *)ps_calloc(compressed_buffer_size, sizeof(uint8_t));
 
-  // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    while (1);  // Halt to catch init failure
   }
-}
-
-void updateBatteryLevel()
-{
-  // TODO:
-  batteryLevelCharacteristic->setValue(&batteryLevel, 1);
-  batteryLevelCharacteristic->notify();
+  Serial.println("Camera initialized successfully");
 }
 
 //
 // Main
 //
 
-// static uint8_t *s_compressed_frame_2 = nullptr;
-// static size_t compressed_buffer_size = 400 + 3;
 void setup() {
   Serial.begin(921600);
-  // SD.begin(21);
+  Serial.println("Setup");
+  Serial.println("Starting BLE...");
   configure_ble();
-  // s_compressed_frame_2 = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
-#ifdef CODEC_OPUS
-  int opus_err;
-  opus_encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION, &opus_err);
-  if (opus_err != OPUS_OK || !opus_encoder)
-  {
-    Serial.println("Failed to create Opus encoder!");
-    while (1)
-      ; // do nothing
-  }
-  opus_encoder_ctl(opus_encoder, OPUS_SET_BITRATE(OPUS_BITRATE));
-#endif
-  configure_microphone();
+  Serial.println("Starting Microphone...");
+  // configure_microphone();
+  Serial.println("Starting Camera...");
   configure_camera();
+  Serial.println("OK");
+  pinMode(LED_BUILTIN, OUTPUT);
 }
 
+uint16_t frame_count = 0;
+unsigned long lastCaptureTime = 0;
+size_t sent_photo_bytes = 0;
+size_t sent_photo_frames = 0;
+bool need_send_photo = false;
+
 void loop() {
+  
+  // Serial.println("Starting Loop...");
   // Read from mic
-  size_t bytes_recorded = read_microphone();
-
-  // Push audio to BLE
-  if (bytes_recorded > 0 && connected)
-  {
-#ifdef CODEC_OPUS
-    int16_t samples[FRAME_SIZE];
-    for (size_t i = 0; i < bytes_recorded; i += 2)
-    {
-      samples[i / 2] = ((s_recording_buffer[i + 1] << 8) | s_recording_buffer[i]) << VOLUME_GAIN;
-    }
-
-    int encoded_bytes = opus_encode(opus_encoder, samples, FRAME_SIZE, &s_compressed_frame[3], MAX_PACKET_SIZE - 3);
-
-    if (encoded_bytes > 0)
-    {
-#else
-#ifdef CODEC_MULAW
-    for (size_t i = 0; i < bytes_recorded; i += 2)
-    {
-      int16_t sample = ((s_recording_buffer[i + 1] << 8) | s_recording_buffer[i]) << VOLUME_GAIN;
-      s_compressed_frame[i / 2 + 3] = linear2ulaw(sample);
-    }
-
-    int encoded_bytes = bytes_recorded / 2;
-#else
-    for (size_t i = 0; i < bytes_recorded / 4; i++)
-    {
-      int16_t sample = ((int16_t *)s_recording_buffer)[i * 2] << VOLUME_GAIN; // Read every other 16-bit sample
-      s_compressed_frame[i * 2 + 3] = sample & 0xFF;           // Low byte
-      s_compressed_frame[i * 2 + 4] = (sample >> 8) & 0xFF;    // High byte
-    }
-
-    int encoded_bytes = bytes_recorded / 2;
-#endif
-#endif
-
-    s_compressed_frame[0] = audio_frame_count & 0xFF;
-    s_compressed_frame[1] = (audio_frame_count >> 8) & 0xFF;
-    s_compressed_frame[2] = 0;
-
-    size_t out_buffer_size = encoded_bytes + 3;
-    audioDataCharacteristic->setValue(s_compressed_frame, out_buffer_size);
-    audioDataCharacteristic->notify();
-    audio_frame_count++;
-#ifdef CODEC_OPUS
-    }
-#endif
-  }
+  // size_t bytes_recorded = read_microphone();
+  // // Push to BLE
+  // if (bytes_recorded > 0 && connected) {
+  //   size_t out_buffer_size = bytes_recorded / 2 + 3;
+  //   for (size_t i = 0; i < bytes_recorded; i += 2) {
+  //     int16_t sample = ((s_recording_buffer[i + 1] << 8) | s_recording_buffer[i]) << VOLUME_GAIN;
+  //     s_compressed_frame[i / 2 + 3] = linear2ulaw(sample);
+  //   }
+  //   s_compressed_frame[0] = frame_count & 0xFF;
+  //   s_compressed_frame[1] = (frame_count >> 8) & 0xFF;
+  //   s_compressed_frame[2] = 0;
+  //   audio->setValue(s_compressed_frame, out_buffer_size);
+  //   audio->notify();
+  //   frame_count++;
+  // }
 
   // Take a photo
   unsigned long now = millis();
+  // Serial.printf("time passed %d",now);
 
-  // Don't take a photo if we are already sending data for previous photo
-  if (isCapturingPhotos && !photoDataUploading && connected)
-  {
-    if ((captureInterval == 0)
-      || ((now - lastCaptureTime) >= captureInterval))
-    {
-      if (captureInterval == 0) {
-        // Single photo requested
-        isCapturingPhotos = false;
-      }
-
-      // Take the photo
-      if (take_photo())
-      {
-        photoDataUploading = true;
-        sent_photo_bytes = 0;
-        sent_photo_frames = 0;
-        lastCaptureTime = now;
-      }
+  // if ((now - lastCaptureTime) % 500 == 0) {
+  //   Serial.println("500 time passed");
+  // }
+  if ((now - lastCaptureTime) >= 5000 && !need_send_photo && connected) {
+  // if (connected) {
+    if (take_photo()) {
+      need_send_photo = true;
+      sent_photo_bytes = 0;
+      sent_photo_frames = 0;
+      lastCaptureTime = now;
     }
   }
 
-  // Push photo data to BLE
-  if (photoDataUploading) {
+  // Push to BLE
+  if (need_send_photo) {
     size_t remaining = fb->len - sent_photo_bytes;
     if (remaining > 0) {
+      // start header
+      // s_compressed_frame_2[0] = 0xAA;
+      // s_compressed_frame_2[1] = 0xAA;
       // Populate buffer
       s_compressed_frame_2[0] = sent_photo_frames & 0xFF;
       s_compressed_frame_2[1] = (sent_photo_frames >> 8) & 0xFF;
@@ -482,31 +300,69 @@ void loop() {
       if (bytes_to_copy > 200) {
         bytes_to_copy = 200;
       }
+      // Serial.printf("Sending frame %d, %d bytes, total sent: %d/%d\n", 
+      //         sent_photo_frames, bytes_to_copy, sent_photo_bytes + bytes_to_copy, fb->len);
       memcpy(&s_compressed_frame_2[2], &fb->buf[sent_photo_bytes], bytes_to_copy);
 
+      // // 打印帧数据
+      // Serial.printf("Frame %d: ", sent_photo_frames);
+      // for (size_t i = 0; i < bytes_to_copy + 2; i++) {
+      //   Serial.printf("%02X ", s_compressed_frame_2[i]);
+      // }
+      // Serial.println();
+
       // Push to BLE
-      photoDataCharacteristic->setValue(s_compressed_frame_2, bytes_to_copy + 2);
-      photoDataCharacteristic->notify();
+      photo_ack_received = false;
+      photo->setValue(s_compressed_frame_2, bytes_to_copy + 2);
+      photo->notify(); 
+      unsigned long timeout = millis();
+
+      // ACK check 
+      while (!photo_ack_received && (millis() - timeout) < 500) {
+        delay(10);  // Wait up to 1s for ACK
+      }
+      // if (!photo_ack_received) {
+      //   Serial.println("No ACK, next byte");
+      //   // }
+      //   photo_ack_received = false;  // Reset for next frame
+      //   sent_photo_bytes += bytes_to_copy;
+      //   sent_photo_frames++;
+      // } else {
+      //   photo_ack_received = false;  // Reset for next frame
+      //   sent_photo_bytes += bytes_to_copy;
+      //   sent_photo_frames++;
+      // }
       sent_photo_bytes += bytes_to_copy;
       sent_photo_frames++;
     } else {
       // End flag
       s_compressed_frame_2[0] = 0xFF;
       s_compressed_frame_2[1] = 0xFF;
-      photoDataCharacteristic->setValue(s_compressed_frame_2, 2);
-      photoDataCharacteristic->notify();
+      photo->setValue(s_compressed_frame_2, 2);
+      photo->notify(); 
 
-      photoDataUploading = false;
+      Serial.println("Photo sent");
+      need_send_photo = false;
     }
   }
 
-  // Update battery level
-  if (now - lastBatteryUpdate > 60000)
-  {
-    updateBatteryLevel();
-    lastBatteryUpdate = millis();
-  }
-
   // Delay
-  delay(20);
+  // digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
+  // delay(1000);                      // wait for a second
+  // digitalWrite(LED_BUILTIN, LOW);   // turn the LED off by making the voltage LOW
+  // delay(1000); 
+  // digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
+  // delay(1000);                      // wait for a second
+  // digitalWrite(LED_BUILTIN, LOW);   // turn the LED off by making the voltage LOW
+  // delay(1000); 
+  // digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
+  // delay(1000);                      // wait for a second
+  // digitalWrite(LED_BUILTIN, LOW);   // turn the LED off by making the voltage LOW
+  // delay(1000); 
+  // digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
+  // delay(1000);                      // wait for a second
+  // digitalWrite(LED_BUILTIN, LOW);   // turn the LED off by making the voltage LOW
+  // delay(1000); 
+  // delay(20); 
+
 }

@@ -56,14 +56,34 @@ function usePhotos(device: BluetoothRemoteGATTServer) {
             const photoCharacteristic = await service.getCharacteristic('19b10005-e8f2-537e-4f6c-d104768a1214');
             await photoCharacteristic.startNotifications();
             setSubscribed(true);
-            photoCharacteristic.addEventListener('characteristicvaluechanged', (e) => {
+            photoCharacteristic.addEventListener('characteristicvaluechanged', async (e) => {
                 let value = (e.target as BluetoothRemoteGATTCharacteristic).value!;
                 let array = new Uint8Array(value.buffer);
+                
+                // Send ACK response
+                try {
+                    const photoControlCharacteristic = await service.getCharacteristic('19b10005-e8f2-537e-4f6c-d104768a1214');
+                    await photoControlCharacteristic.writeValue(new TextEncoder().encode('ACK'));
+                    // console.log('Sent ACK');
+                } catch (error) {
+                    console.error('Failed to send ACK:', error);
+                }
+            
+
+            
                 if (array[0] == 0xff && array[1] == 0xff) {
                     onChunk(null, new Uint8Array());
-                } else {
+                } 
+                // Check minimum size (similar to Python's len(chunk) < 4)
+                else if (array.length < 4) {
+                    // console.log('Skipping packet', array.length);
+                    return;
+                }
+                else {
                     let packetId = array[0] + (array[1] << 8);
                     let packet = array.slice(2);
+                    // print packetId and packet[:20]
+                    // console.log('Packet', packetId, packet.slice(0, 20), packet.length);
                     onChunk(packetId, packet);
                 }
             });

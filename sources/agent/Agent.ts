@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { AsyncLock } from "../utils/lock";
-import { imageDescription, llamaFind } from "./imageDescription";
+import { llamaFind } from "./imageDescription";
+import { describeImage } from "../modules/openai";
 import { startAudio } from '../modules/openai';
 
 type AgentState = {
@@ -23,7 +24,7 @@ export class Agent {
             let lastDescription: string | null = null;
             for (let p of photos) {
                 console.log('Processing photo', p.length);
-                let description = await imageDescription(p);
+                let description = await describeImage(p);
                 console.log('Description', description);
                 this.#photos.push({ photo: p, description });
                 lastDescription = description;
@@ -59,6 +60,7 @@ export class Agent {
                 i++;
             }
             let answer = await llamaFind(question, combined);
+            console.log('answer', answer);
             this.#state.answer = answer;
             this.#state.loading = false;
             this.#notify();
